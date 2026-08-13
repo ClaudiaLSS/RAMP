@@ -36,6 +36,9 @@ from ramp.post_process.post_process import Plot
 from typing import List, Union, Iterable
 from ramp.errors_logs.errors import InvalidType, InvalidWindow
 
+#: number of minutes of a single simulated day
+DAY_MINUTES = 1440
+
 
 def single_appliance_daily_load_profile(args):
     app, args = args
@@ -386,6 +389,36 @@ class UseCase:
         # The peak_time is randomly enlarged based on the calibration parameter peak_enlarge
         return np.arange(peak_time - rand_peak_enlarge, peak_time + rand_peak_enlarge)
 
+    @property
+    def profile_length(self):
+        """Length in minutes of the extended day the use case is simulated on
+
+        This is one day, unless some appliance has a window of use crossing midnight,
+        in which case the day is extended to accommodate the after-midnight part of the
+        switch-on events. See :py:attr:`Appliance.profile_length`.
+        """
+        return max([DAY_MINUTES] + [user.profile_length for user in self.users])
+
+    def _accumulate_day(self, daily_profiles, day_idx, usecase_load):
+        """Add the load of one extended day to daily_profiles, carrying over midnight
+
+        Appliances whose window of use crosses midnight (i.e. declared with an end time
+        beyond minute 1440) produce switch-on events which run past the end of
+        ``day_idx``. Those minutes physically belong to the morning of the following day,
+        so they are added to the next row of ``daily_profiles`` rather than being
+        truncated or wrapped back onto the same day.
+
+        The simulation horizon is treated as periodic, so the last day spills over onto
+        the first one. This conserves the total energy of the simulation exactly and
+        avoids leaving the morning of the first day without any carry-in, which would
+        reintroduce the very discontinuity this is meant to remove.
+        """
+        daily_profiles[day_idx, :] += usecase_load[:DAY_MINUTES]
+        after_midnight = usecase_load[DAY_MINUTES:]
+        if after_midnight.size > 0:
+            next_day = (day_idx + 1) % self.num_days
+            daily_profiles[next_day, : after_midnight.size] += after_midnight
+
     def generate_daily_load_profiles(
         self, days=None, flat=True, cases=None, verbose=False
     ):
@@ -426,11 +459,14 @@ class UseCase:
             if self.parallel_processing is True:
                 daily_profiles = self.generate_daily_load_profiles_parallel(flat=False)
             else:
-                daily_profiles = np.zeros((self.num_days, 1440))
+                daily_profiles = np.zeros((self.num_days, DAY_MINUTES))
+                profile_length = self.profile_length
                 for day_idx, day in enumerate(self.days):
                     # initialise an empty daily profile (or profile load)
                     # that will be filled with the sum of the daily profiles of each User instance
-                    usecase_load = np.zeros(1440)
+                    # it may be longer than a day if some appliance's window of use
+                    # crosses midnight
+                    usecase_load = np.zeros(profile_length)
                     # for each User instance generate a load profile, iterating through all user of this instance and
                     # all appliances they own, corresponds to step 2. of [1], p.7
                     for user in self.users:
@@ -438,8 +474,10 @@ class UseCase:
                             day_idx, self.peak_time_range, get_day_type(day)
                         )
                         # aggregate the user load to the usecase load
-                        usecase_load = usecase_load + user.load
-                    daily_profiles[day_idx, :] = usecase_load
+                        usecase_load[: user.load.size] += user.load
+                    # the part of usecase_load which lies past midnight is carried over
+                    # to the next day instead of being cut off
+                    self._accumulate_day(daily_profiles, day_idx, usecase_load)
                     # screen update about progress of computation
                     if verbose is True:
                         # logging.info
@@ -504,12 +542,16 @@ class UseCase:
                         daily_profiles_dict[prof_i] = [daily_load]
                     pbar.update()
 
-            daily_profiles = np.zeros((self.num_days, 1440))
+            daily_profiles = np.zeros((self.num_days, DAY_MINUTES))
+            profile_length = self.profile_length
 
             for day_idx in range(self.num_days):
-                daily_profiles[day_idx, :] = np.vstack(
-                    daily_profiles_dict[day_idx]
-                ).sum(axis=0)
+                # appliance profiles do not all have the same length, as only those with
+                # a window crossing midnight extend past minute 1440
+                day_load = np.zeros(profile_length)
+                for appliance_load in daily_profiles_dict[day_idx]:
+                    day_load[: appliance_load.size] += appliance_load
+                self._accumulate_day(daily_profiles, day_idx, day_load)
 
         if flat is True:
             answer = daily_profiles.reshape(1, self.num_days * 1440).squeeze()
@@ -797,6 +839,15 @@ appliances: no appliances assigned to the user.
         return app
 
     @property
+    def profile_length(self):
+        """Length in minutes of the extended day the user is simulated on
+
+        This is one day, unless one of the user's appliances has a window of use crossing
+        midnight. See :py:attr:`Appliance.profile_length`.
+        """
+        return max([DAY_MINUTES] + [app.profile_length for app in self.App_list])
+
+    @property
     def maximum_profile(self) -> np.array:
         """Aggregate the theoretical maximal profiles of each appliance of the user by switching the appliance always on
 
@@ -1001,7 +1052,7 @@ appliances: no appliances assigned to the user.
                 self.usecase.peak_time_range = self.usecase.calc_peak_time_range()
             peak_time_range = self.usecase.peak_time_range
 
-        single_load = np.zeros(1440)
+        single_load = np.zeros(self.profile_length)
 
         self.rand_daily_pref = (
             0 if self.user_preference == 0 else random.randint(1, self.user_preference)
@@ -1014,9 +1065,10 @@ appliances: no appliances assigned to the user.
                 prof_i, peak_time_range, day_type, power=App.power[prof_i]
             )
 
-            single_load = (
-                single_load + App.daily_use
-            )  # adds the Appliance load profile to the single User load profile
+            # adds the Appliance load profile to the single User load profile. Only the
+            # appliances whose window of use crosses midnight have a profile longer than
+            # a day, hence the slicing
+            single_load[: App.daily_use.size] += App.daily_use
         return single_load
 
     def generate_aggregated_load_profile(
@@ -1045,7 +1097,9 @@ appliances: no appliances assigned to the user.
         Each single load profile has its own separate randomisation
         """
 
-        self.load = np.zeros(1440)  # initialise empty load for User instance
+        self.load = np.zeros(
+            self.profile_length
+        )  # initialise empty load for User instance
         for _ in range(self.num_users):
             # iterates for every single user within a User class.
             self.load = self.load + self.generate_single_load_profile(
@@ -1187,7 +1241,10 @@ class Appliance:
         self.random_var_1 = 0
         self.random_var_2 = 0
         self.random_var_3 = 0
-        self.daily_use = np.zeros(1440)
+        # number of minutes by which the windows of use extend past midnight, 0 unless a
+        # window is declared with an end time greater than 1440
+        self.window_spill = 0
+        self.daily_use = np.zeros(DAY_MINUTES)
         self.free_spots = None
 
         # attributes used for specific fixed and random cycles
@@ -1381,6 +1438,27 @@ class Appliance:
                 window_2 = [30,35],
                 window_3 = [40,55]
             )
+
+        Windows crossing midnight
+        -------------------------
+        A window may end after midnight, by declaring an end time greater than 1440. An
+        appliance which is used continuously from 20:00 until 05:00 of the next day is
+        declared as a *single* window:
+
+        .. code-block:: python
+
+            app.windows(window_1=[1200, 1740])  # 20:00 -> 05:00 (1440 + 300)
+
+        This is not equivalent to splitting the same period over two windows
+        (``[1200, 1440]`` and ``[0, 300]``): two windows are randomised independently and
+        get their own switch-on events, so the appliance is systematically switched off
+        around midnight. With a single window crossing midnight, the boundaries are
+        randomised once, a switch-on event may span midnight, and the part of the event
+        which lies past minute 1440 is carried over to the morning of the next day by
+        :py:meth:`UseCase._accumulate_day`.
+
+        Only the *end* of a window may cross midnight, and no window may be longer than
+        one day.
         """
 
         if window_1 is None:
@@ -1409,6 +1487,27 @@ class Appliance:
         else:
             self.window_3 = window_3
 
+        # validate the windows and work out by how much they extend past midnight
+        self.window_spill = 0
+        for i in range(1, 4):
+            _window = getattr(self, f"window_{i}")
+            w_start, w_stop = int(_window[0]), int(_window[1])
+            if w_start < 0 or w_stop < w_start:
+                raise InvalidWindow(
+                    f"Window {i} of appliance '{self.name}' of user '{self.user.user_name}' is [{w_start}, {w_stop}], which is not a valid window. A window must verify 0 <= start <= end."
+                )
+            if w_stop - w_start > DAY_MINUTES:
+                raise InvalidWindow(
+                    f"Window {i} of appliance '{self.name}' of user '{self.user.user_name}' spans {w_stop - w_start} minutes, which is longer than a day ({DAY_MINUTES} minutes)."
+                )
+            if w_start >= DAY_MINUTES and w_stop > w_start:
+                raise InvalidWindow(
+                    f"Window {i} of appliance '{self.name}' of user '{self.user.user_name}' starts at minute {w_start}, which is outside the day [0, {DAY_MINUTES}]. Only the end of a window may cross midnight."
+                )
+            # a window ending past minute 1440 crosses midnight, the appliance is then
+            # simulated on a day extended by the largest of those overshoots
+            self.window_spill = max(self.window_spill, w_stop - DAY_MINUTES)
+
         # check that the time allocated by the windows is larger or equal to the func_time of the appliance
         window_time = 0
         for i in range(1, self.num_windows + 1, 1):
@@ -1419,16 +1518,14 @@ class Appliance:
             )
 
         self.random_var_w = random_var_w
-        self.daily_use = np.zeros(1440)  # create an empty daily use profile
-        self.daily_use[self.window_1[0] : (self.window_1[1])] = np.full(
-            np.diff(self.window_1), 0.001
-        )  # fills the daily use profile with infinitesimal values that are just used to identify the functioning windows
-        self.daily_use[self.window_2[0] : (self.window_2[1])] = np.full(
-            np.diff(self.window_2), 0.001
-        )  # same as above for window2
-        self.daily_use[self.window_3[0] : (self.window_3[1])] = np.full(
-            np.diff(self.window_3), 0.001
-        )  # same as above for window3
+        # create an empty daily use profile, extended past midnight if one of the windows
+        # crosses it
+        self.daily_use = np.zeros(self.profile_length)
+        # fills the daily use profile with infinitesimal values that are just used to
+        # identify the functioning windows
+        for i in range(1, 4):
+            _window = getattr(self, f"window_{i}")
+            self.daily_use[_window[0] : _window[1]] = 0.001
 
         self.random_var_1 = int(
             random_var_w * np.diff(self.window_1)[0]
@@ -1508,30 +1605,28 @@ class Appliance:
         # identify which of the unallocated time ranges contain the switch-on event
         spot_idx = None
         for i, fs in enumerate(self.free_spots):
-            # THE FIX: Only check the start index, so wrapped overnight events don't get lost
-            if indexes[0] >= fs.start and indexes[0] <= fs.stop:
+            if indexes[0] >= fs.start and indexes[-1] <= fs.stop:
                 spot_idx = i
                 break
-                
         if spot_idx is not None:
             spot_to_split = self.free_spots.pop(spot_idx)
-            
-            # THE FIX: Cap the tracker to 1440 so we don't break the free_spots math
-            idx_end = min(indexes[-1], spot_to_split.stop)
 
-            if indexes[0] == spot_to_split.start and idx_end == spot_to_split.stop:
-                pass  
+            if indexes[0] == spot_to_split.start and indexes[-1] == spot_to_split.stop:
+                pass  # nothing to do as the whole range should be removed, which is already the case from line above
             elif indexes[0] == spot_to_split.start:
+                # reinsert a range going from end of indexes up to the end of picked range
                 self.free_spots.insert(
-                    spot_idx, slice(idx_end + 1, spot_to_split.stop, None)
+                    spot_idx, slice(indexes[-1] + 1, spot_to_split.stop, None)
                 )
-            elif idx_end == spot_to_split.stop:
+            elif indexes[-1] == spot_to_split.stop:
+                # reinsert a range going from beginning of picked range up to the beginning of indexes
                 self.free_spots.insert(
                     spot_idx, slice(spot_to_split.start, indexes[0], None)
                 )
             else:
+                # split the range into 2 smaller ranges
                 new_spot1 = slice(spot_to_split.start, indexes[0], None)
-                new_spot2 = slice(idx_end + 1, spot_to_split.stop, None)
+                new_spot2 = slice(indexes[-1] + 1, spot_to_split.stop, None)
 
                 self.free_spots.insert(spot_idx, new_spot2)
                 self.free_spots.insert(spot_idx, new_spot1)
@@ -1549,28 +1644,46 @@ class Appliance:
 
         if (
             self.fixed_cycle > 0
-        ):  
+        ):  # evaluates if the app has some duty cycles to be considered
+            # the proper duty cycle was selected in self.rand_switch_on_window()
+            # now setting the corresponding power values in the indexes range
             if self.current_duty_cycle_id == 1:
-                np.put(self.daily_use, indexes % 1440, (self.random_cycle1 * coincidence))
+                np.put(self.daily_use, indexes, (self.random_cycle1 * coincidence))
             elif self.current_duty_cycle_id == 2:
-                np.put(self.daily_use, indexes % 1440, (self.random_cycle2 * coincidence))
+                np.put(self.daily_use, indexes, (self.random_cycle2 * coincidence))
             elif self.current_duty_cycle_id == 3:
-                np.put(self.daily_use, indexes % 1440, (self.random_cycle3 * coincidence))
+                np.put(self.daily_use, indexes, (self.random_cycle3 * coincidence))
             else:
                 print(
                     f"The app {self.name} has duty cycle option on, however the switch on event fell outside the provided duty cycle windows"
                 )
 
-        else:  
+        else:  # if no duty cycles are specified, a regular switch_on event is modelled
+            # randomises also the App Power if thermal_p_var is on
             np.put(
                 self.daily_use,
-                indexes % 1440,  # THE FIX: Wraps indices > 1440 into the morning
+                indexes,
                 (random_variation(var=self.thermal_p_var, norm=coincidence * power)),
             )
         # updates the time ranges remaining for switch on events, excluding the current switch_on event
         self.update_available_time_for_switch_on_events(indexes)
 
-    def calc_rand_window(self, window_idx=1, window_range_limits=[0, 1440]):
+    @property
+    def profile_length(self):
+        """Length in minutes of the profile on which the appliance is simulated
+
+        One day (1440 minutes), extended by :py:attr:`window_spill` minutes when one of
+        the windows of use crosses midnight. Switch-on events may then run past minute
+        1440, and :py:meth:`UseCase._accumulate_day` carries that part over to the
+        morning of the following day.
+        """
+        return DAY_MINUTES + self.window_spill
+
+    def calc_rand_window(self, window_idx=1, window_range_limits=None):
+        if window_range_limits is None:
+            # the randomised window must remain within the simulated profile, which is
+            # longer than a day when one of the windows crosses midnight
+            window_range_limits = [0, self.profile_length]
         _window = self.__getattribute__(f"window_{window_idx}")
         _random_var = self.__getattribute__(f"random_var_{window_idx}")
         rand_window = [
@@ -1594,7 +1707,18 @@ class Appliance:
             It assumes the appliance is always switched-on with maximum power and
             numerosity during all of its potential windows of use
         """
-        return self.daily_use * np.mean(self.power) * self.number
+        # an appliance with a window crossing midnight is simulated on an extended day;
+        # the part past midnight belongs to the morning of the next day, which for a
+        # 24 hour maximum profile means folding it back onto the beginning of the day.
+        # The fold takes the maximum rather than the sum, as the appliance cannot be more
+        # than fully switched on at a given minute
+        windows_mask = np.array(self.daily_use[:DAY_MINUTES])
+        after_midnight = self.daily_use[DAY_MINUTES:]
+        if after_midnight.size > 0:
+            windows_mask[: after_midnight.size] = np.maximum(
+                windows_mask[: after_midnight.size], after_midnight
+            )
+        return windows_mask * np.mean(self.power) * self.number
 
     def specific_cycle(self, cycle_num, **kwargs):
         """assigining specific duty cycle for the appliance (maximum of three cycles can be assigned)
@@ -1843,11 +1967,9 @@ class Appliance:
                     spot_idx = i
                     break
 
-            # THE FIX: If the window ends exactly at midnight (1440), let it run into the morning!
-            if self.free_spots[spot_idx].stop == 1440:
-                largest_duration = rand_time
-            else:
-                largest_duration = min(rand_time, self.free_spots[spot_idx].stop - switch_on)
+            largest_duration = min(
+                rand_time, self.free_spots[spot_idx].stop - switch_on
+            )
 
             if largest_duration > self.func_cycle:
                 indexes = np.arange(
@@ -1870,8 +1992,7 @@ class Appliance:
                 self.fixed_cycle > 0
             ):  # evaluates if the app has some duty cycles to be considered
                 indexes_low = indexes[0]
-                # THE FIX: Cap the tracking index so the engine's internal memory doesn't crash
-                indexes_high = min(indexes[-1], 1440)
+                indexes_high = indexes[-1]
                 # selects the proper duty cycle
                 if range_within_window(
                     indexes_low, indexes_high, self.cw11
@@ -1980,8 +2101,9 @@ class Appliance:
             Generating high-resolution multi-energy load profiles for remote areas with an open-source stochastic model,
             Energy, 2019, https://doi.org/10.1016/j.energy.2019.04.097.
         """
-        # initialises variables for the cycle
-        self.daily_use = np.zeros(1440)
+        # initialises variables for the cycle, on an extended day if one of the windows
+        # of use crosses midnight
+        self.daily_use = np.zeros(self.profile_length)
 
         # skip this appliance in any of the following applies
         if (
@@ -2015,11 +2137,9 @@ class Appliance:
             # created windows without applying any further stochasticity
             total_power_value = self.power[prof_i] * self.number
             for rand_window in rand_windows:
-                # THE FIX: Use np.put with modulo 1440 to allow midnight continuity
-                indexes = np.arange(rand_window[0], rand_window[1])
-                np.put(self.daily_use, indexes % 1440, np.full(
+                self.daily_use[rand_window[0] : rand_window[1]] = np.full(
                     np.diff(rand_window), total_power_value
-                ))
+                )
             # single_load = single_load + self.daily_use
             return
         else:

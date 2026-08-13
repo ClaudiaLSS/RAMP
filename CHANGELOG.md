@@ -4,6 +4,8 @@ Release History
 0.5.2 (dev)
 -----------
 
+**|new|**       Windows of use may cross midnight, by declaring an end time greater than 1440 (e.g. `windows(window_1=[1200, 1740])` for an appliance used from 20:00 until 05:00 of the next day). Switch-on events may then span midnight and the part of an event past minute 1440 is carried over to the morning of the following day, instead of being cut off. Declaring such a use as two separate windows (`[1200, 1440]` and `[0, 300]`) randomises the two windows independently and gives each its own switch-on events, which systematically switches the appliance off around midnight.
+
 **|new|**       Addition of the 'coveralls' badge to the README
 
 **|new|**       Addition of a random-seed functionality to ensure reproducible results if needed
