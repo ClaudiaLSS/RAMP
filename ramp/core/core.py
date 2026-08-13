@@ -366,8 +366,10 @@ class UseCase:
         for user in self.users:
             tot_max_profile = tot_max_profile + user.maximum_profile
         # Find the peak window within the theoretical max profile
-        peak_window = np.squeeze(
-            np.argwhere(tot_max_profile == np.amax(tot_max_profile))
+        # atleast_1d keeps a peak window of a single minute as a 1 element array: squeeze
+        # would otherwise collapse it to a 0 dimensional array, which cannot be indexed
+        peak_window = np.atleast_1d(
+            np.squeeze(np.argwhere(tot_max_profile == np.amax(tot_max_profile)))
         )
         # Within the peak_window, randomly calculate the peak_time using a gaussian distribution
         peak_time = round(
@@ -511,6 +513,19 @@ class UseCase:
                 raise ValueError(
                     "You must provide days either with start and end date and run initialize() method of UseCase instance or as an argument of 'generate_daily_load_profiles'"
                 )
+
+        masked_users = [
+            user.user_name for user in self.users if user.occupancy_mask_enabled
+        ]
+        if masked_users:
+            raise NotImplementedError(
+                "The occupancy mask is not supported with parallel_processing=True. "
+                f"The following users have a prob_home assigned: {masked_users}. "
+                "Parallel generation dispatches one task per (appliance, day) and loses "
+                "the grouping of appliances into individual households, so a single "
+                "presence draw cannot be shared between the appliances of one household. "
+                "Run this use case with parallel_processing=False instead."
+            )
 
         max_parallel_processes = multiprocessing.cpu_count()
         tasks = []
@@ -694,6 +709,7 @@ class User:
         num_users: int = 1,
         user_preference: int = 0,
         usecase=None,
+        prob_home: float = None,
     ):
         """Creates a User instance (User Category)
 
@@ -705,6 +721,31 @@ class User:
             number of users within the resprective user-type, by default 1
         user_preference : int {0,1,2,3}, optional
             Related to cooking behaviour, how many types of meal a user wants a day (number of user preferences has to be defined here and will be further specified with pref_index parameter), by default 0
+        prob_home : float, optional
+            Probability, in [0, 1], that a household of this category is present ("home")
+            on any given day. Enables the *occupancy mask*: a single presence draw is made
+            per household per day and gates all of that household's appliances together, so
+            an absent household produces exactly zero load that day. By default None, which
+            disables the occupancy mask entirely (households are always home, and no random
+            number is drawn, so results are identical to RAMP without this feature).
+
+        Notes
+        -----
+        When the occupancy mask is active, the ``occasional_use`` of every appliance owned
+        by this user becomes **conditional on the household being home**, i.e. it is read as
+        "fraction of HOME days" rather than "fraction of all days". The two draws are
+        independent and compose multiplicatively::
+
+            P(appliance runs on a given day) = prob_home * occasional_use
+
+        The occupancy mask can therefore only remove days on which appliances would
+        otherwise have run; it never makes an appliance more likely to run. Input values of
+        ``occasional_use`` are expected to already be present-conditional.
+
+        Raises
+        ------
+        ValueError
+            if prob_home is set to a value outside of [0, 1]
         """
         # TODO check type of Usecase
         self.usecase = usecase
@@ -712,6 +753,14 @@ class User:
         self.num_users = num_users
         self.user_preference = user_preference
         self.rand_daily_pref = 0
+        if prob_home is not None and not 0 <= prob_home <= 1:
+            raise ValueError(
+                f"prob_home of user '{user_name}' is {prob_home}, it must be a probability within [0, 1]"
+            )
+        self.prob_home = prob_home
+        # presence of the household on the day being simulated. Always True unless the
+        # occupancy mask is active and the daily draw came out "absent"
+        self.is_home_today = True
         self.load = None
         self.App_list = (
             []
@@ -732,6 +781,14 @@ appliances: no appliances assigned to the user.
 
     def __repr__(self):
         return self.__str__()
+
+    @property
+    def occupancy_mask_enabled(self) -> bool:
+        """Whether the occupancy mask is active for this user category
+
+        The mask is opt-in: it is enabled only by assigning a ``prob_home`` to the user.
+        """
+        return self.prob_home is not None
 
     def _add_appliance_instance(self, appliances):
         if isinstance(appliances, Appliance):
@@ -904,6 +961,18 @@ appliances: no appliances assigned to the user.
         2. Appliances are added to the user-type only if **'windows'** method of the Appliance is called.
         """
 
+        if self.occupancy_mask_enabled:
+            # the xlsx model format has no column for prob_home, so the occupancy mask
+            # settings of this user would not survive a save/load round trip
+            warnings.warn(
+                f"User '{self.user_name}' has prob_home={self.prob_home} (occupancy mask "
+                "enabled), which is not part of the saved model format and will therefore "
+                "be lost. Reloading the saved file will yield a use case with the "
+                "occupancy mask disabled. Set prob_home in your python input file instead "
+                "of relying on the saved database.",
+                UserWarning,
+            )
+
         try:
             answer = pd.concat([app.save() for app in self.App_list], ignore_index=True)
         except ValueError:
@@ -1056,6 +1125,16 @@ appliances: no appliances assigned to the user.
 
         self.rand_daily_pref = (
             0 if self.user_preference == 0 else random.randint(1, self.user_preference)
+        )
+
+        # occupancy mask: a single presence draw for this household on this day, shared by
+        # all of its appliances (see Appliance.generate_load_profile). Drawing it here, once
+        # per call, is what makes absence a household-level fact: every appliance of an
+        # absent household is switched off together, rather than each rolling its own
+        # independent absence die. When the mask is disabled no random number is consumed,
+        # which keeps the random stream identical to a run without this feature.
+        self.is_home_today = (
+            True if self.prob_home is None else random.uniform(0, 1) < self.prob_home
         )
 
         for (
@@ -1245,6 +1324,9 @@ class Appliance:
         # window is declared with an end time greater than 1440
         self.window_spill = 0
         self.daily_use = np.zeros(DAY_MINUTES)
+        # mask of the windows of use, assigned by the windows method. Kept separate from
+        # daily_use, which holds the realised load of the day currently being simulated
+        self.windows_mask = np.zeros(DAY_MINUTES)
         self.free_spots = None
 
         # attributes used for specific fixed and random cycles
@@ -1526,6 +1608,10 @@ class Appliance:
         for i in range(1, 4):
             _window = getattr(self, f"window_{i}")
             self.daily_use[_window[0] : _window[1]] = 0.001
+        # keep an immutable copy of that mask: daily_use is overwritten with the realised
+        # load of the day being simulated on every call to generate_load_profile, whereas
+        # maximum_profile needs the windows of use, which do not change during a simulation
+        self.windows_mask = self.daily_use.copy()
 
         self.random_var_1 = int(
             random_var_w * np.diff(self.window_1)[0]
@@ -1706,14 +1792,22 @@ class Appliance:
         np.array
             It assumes the appliance is always switched-on with maximum power and
             numerosity during all of its potential windows of use
+
+        Notes
+        -----
+        This is derived from ``windows_mask`` and not from ``daily_use``. The two are
+        identical until the first day is simulated, after which ``daily_use`` holds the
+        realised load of the last simulated day. Reading it here would make the
+        "theoretical maximum" depend on the simulation state, and would scale an already
+        power-weighted profile by the power a second time.
         """
         # an appliance with a window crossing midnight is simulated on an extended day;
         # the part past midnight belongs to the morning of the next day, which for a
         # 24 hour maximum profile means folding it back onto the beginning of the day.
         # The fold takes the maximum rather than the sum, as the appliance cannot be more
         # than fully switched on at a given minute
-        windows_mask = np.array(self.daily_use[:DAY_MINUTES])
-        after_midnight = self.daily_use[DAY_MINUTES:]
+        windows_mask = np.array(self.windows_mask[:DAY_MINUTES])
+        after_midnight = self.windows_mask[DAY_MINUTES:]
         if after_midnight.size > 0:
             windows_mask[: after_midnight.size] = np.maximum(
                 windows_mask[: after_midnight.size], after_midnight
@@ -2107,7 +2201,13 @@ class Appliance:
 
         # skip this appliance in any of the following applies
         if (
-            random.uniform(0, 1) > self.occasional_use
+            # occupancy mask: the household this appliance belongs to is away today, so all
+            # of its appliances are off. Evaluated first so that, on an absent day, the
+            # occasional_use draw below is short-circuited and never consumed: presence and
+            # occasional use stay independent, giving
+            # P(appliance runs) = prob_home * occasional_use
+            not self.user.is_home_today
+            or random.uniform(0, 1) > self.occasional_use
             # evaluates if daily preference coincides with the randomised daily preference number
             or (self.pref_index != 0 and self.user.rand_daily_pref != self.pref_index)
             # checks if the app is allowed in the given yearly behaviour pattern

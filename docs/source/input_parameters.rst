@@ -297,6 +297,79 @@ parameters to describe the ith duty cycle are the following: ``p_i1``,
 possible to provide the parameters ``cwi1`` and ``cwi2`` using the
 method ``cycle_behaviour`` of the appliance.
 
+.. _occupancy_mask:
+
+Occupancy mask (household absence)
+----------------------------------
+
+Households which are intermittently **absent** — away for days or weeks
+at a time — can be modelled by giving the ``User`` a ``prob_home``, the
+probability that a household of that category is present on any given
+day:
+
+.. code-block:: python
+
+   household = User(user_name="seasonal household", num_users=30, prob_home=0.7)
+
+This enables the *occupancy mask*: one presence draw is made **per
+household, per day**, and it gates **all** of that household's
+appliances together. On an absent day every appliance of that household
+produces exactly zero load; on a home day each appliance behaves
+normally, following its own ``occasional_use``.
+
+Drawing presence once per household is the whole point of the feature.
+Encoding absence in each appliance's ``occasional_use`` instead would
+give every appliance its own independent absence die, producing
+incoherent days on which some appliances of a household run while others
+which belong to the same routine do not. Absence is a property of the
+household, not of the appliance.
+
+Note that ``prob_home`` is defined per user *category*, but each of the
+``num_users`` households within that category rolls its own draw. A
+category of 30 households with ``prob_home=0.7`` therefore has roughly
+9 absent households on any given day, not a 30% chance of all 30 being
+absent at once.
+
+``occasional_use`` becomes present-conditional
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The presence draw and the ``occasional_use`` draw are independent, and
+compose multiplicatively::
+
+   P(appliance runs on a given day) = prob_home * occasional_use
+
+With the occupancy mask active, an appliance's ``occasional_use`` must
+therefore be read as **"fraction of HOME days"** rather than "fraction
+of all days", and input values are expected to be supplied on that
+basis. The mask can only remove days on which an appliance would
+otherwise have run; it never makes an appliance more likely to run.
+
+To keep the average load curve unchanged while introducing absence, an
+``occasional_use`` of :math:`q` under the old interpretation becomes
+:math:`q / prob\_home` under the new one. This is only possible while
+that ratio stays at or below 1: an appliance cannot run more often than
+every single home day.
+
+Limitations
+~~~~~~~~~~~
+
+- The occupancy mask is **opt-in**. Leaving ``prob_home`` at its default
+  of ``None`` disables it entirely and consumes no random number, so
+  existing use cases reproduce their previous results exactly.
+- It is **not supported with** ``parallel_processing=True``, which
+  raises ``NotImplementedError``. Parallel generation dispatches one
+  task per (appliance, day) and loses the grouping of appliances into
+  individual households, so a single presence draw cannot be shared
+  between the appliances of one household.
+- ``prob_home`` is **not part of the .xlsx model format** and is not
+  written by ``save`` nor read by ``load``; it must be set in a python
+  input file. Saving a model whose users have a ``prob_home`` emits a
+  warning to that effect.
+- Absence gates *every* appliance of the household, including ones
+  declared ``flat`` such as a refrigerator. If an appliance should keep
+  running while the household is away, it should be assigned to a
+  separate ``User`` without a ``prob_home``.
+
 The legacy way to create an appliance instance is by using the
 ``Appliance`` method of the user (note that the names of input
 parameters are the old ones). This way of creating an appliance is to
