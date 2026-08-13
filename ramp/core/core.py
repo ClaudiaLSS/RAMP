@@ -1508,28 +1508,30 @@ class Appliance:
         # identify which of the unallocated time ranges contain the switch-on event
         spot_idx = None
         for i, fs in enumerate(self.free_spots):
-            if indexes[0] >= fs.start and indexes[-1] <= fs.stop:
+            # THE FIX: Only check the start index, so wrapped overnight events don't get lost
+            if indexes[0] >= fs.start and indexes[0] <= fs.stop:
                 spot_idx = i
                 break
+                
         if spot_idx is not None:
             spot_to_split = self.free_spots.pop(spot_idx)
+            
+            # THE FIX: Cap the tracker to 1440 so we don't break the free_spots math
+            idx_end = min(indexes[-1], spot_to_split.stop)
 
-            if indexes[0] == spot_to_split.start and indexes[-1] == spot_to_split.stop:
-                pass  # nothing to do as the whole range should be removed, which is already the case from line above
+            if indexes[0] == spot_to_split.start and idx_end == spot_to_split.stop:
+                pass  
             elif indexes[0] == spot_to_split.start:
-                # reinsert a range going from end of indexes up to the end of picked range
                 self.free_spots.insert(
-                    spot_idx, slice(indexes[-1] + 1, spot_to_split.stop, None)
+                    spot_idx, slice(idx_end + 1, spot_to_split.stop, None)
                 )
-            elif indexes[-1] == spot_to_split.stop:
-                # reinsert a range going from beginning of picked range up to the beginning of indexes
+            elif idx_end == spot_to_split.stop:
                 self.free_spots.insert(
                     spot_idx, slice(spot_to_split.start, indexes[0], None)
                 )
             else:
-                # split the range into 2 smaller ranges
                 new_spot1 = slice(spot_to_split.start, indexes[0], None)
-                new_spot2 = slice(indexes[-1] + 1, spot_to_split.stop, None)
+                new_spot2 = slice(idx_end + 1, spot_to_split.stop, None)
 
                 self.free_spots.insert(spot_idx, new_spot2)
                 self.free_spots.insert(spot_idx, new_spot1)
@@ -1547,25 +1549,22 @@ class Appliance:
 
         if (
             self.fixed_cycle > 0
-        ):  # evaluates if the app has some duty cycles to be considered
-            # the proper duty cycle was selected in self.rand_switch_on_window()
-            # now setting the corresponding power values in the indexes range
+        ):  
             if self.current_duty_cycle_id == 1:
-                np.put(self.daily_use, indexes, (self.random_cycle1 * coincidence))
+                np.put(self.daily_use, indexes % 1440, (self.random_cycle1 * coincidence))
             elif self.current_duty_cycle_id == 2:
-                np.put(self.daily_use, indexes, (self.random_cycle2 * coincidence))
+                np.put(self.daily_use, indexes % 1440, (self.random_cycle2 * coincidence))
             elif self.current_duty_cycle_id == 3:
-                np.put(self.daily_use, indexes, (self.random_cycle3 * coincidence))
+                np.put(self.daily_use, indexes % 1440, (self.random_cycle3 * coincidence))
             else:
                 print(
                     f"The app {self.name} has duty cycle option on, however the switch on event fell outside the provided duty cycle windows"
                 )
 
-        else:  # if no duty cycles are specified, a regular switch_on event is modelled
-            # randomises also the App Power if thermal_p_var is on
+        else:  
             np.put(
                 self.daily_use,
-                indexes,
+                indexes % 1440,  # THE FIX: Wraps indices > 1440 into the morning
                 (random_variation(var=self.thermal_p_var, norm=coincidence * power)),
             )
         # updates the time ranges remaining for switch on events, excluding the current switch_on event
@@ -1844,9 +1843,11 @@ class Appliance:
                     spot_idx = i
                     break
 
-            largest_duration = min(
-                rand_time, self.free_spots[spot_idx].stop - switch_on
-            )
+            # THE FIX: If the window ends exactly at midnight (1440), let it run into the morning!
+            if self.free_spots[spot_idx].stop == 1440:
+                largest_duration = rand_time
+            else:
+                largest_duration = min(rand_time, self.free_spots[spot_idx].stop - switch_on)
 
             if largest_duration > self.func_cycle:
                 indexes = np.arange(
@@ -1869,7 +1870,8 @@ class Appliance:
                 self.fixed_cycle > 0
             ):  # evaluates if the app has some duty cycles to be considered
                 indexes_low = indexes[0]
-                indexes_high = indexes[-1]
+                # THE FIX: Cap the tracking index so the engine's internal memory doesn't crash
+                indexes_high = min(indexes[-1], 1440)
                 # selects the proper duty cycle
                 if range_within_window(
                     indexes_low, indexes_high, self.cw11
@@ -2013,9 +2015,11 @@ class Appliance:
             # created windows without applying any further stochasticity
             total_power_value = self.power[prof_i] * self.number
             for rand_window in rand_windows:
-                self.daily_use[rand_window[0] : rand_window[1]] = np.full(
+                # THE FIX: Use np.put with modulo 1440 to allow midnight continuity
+                indexes = np.arange(rand_window[0], rand_window[1])
+                np.put(self.daily_use, indexes % 1440, np.full(
                     np.diff(rand_window), total_power_value
-                )
+                ))
             # single_load = single_load + self.daily_use
             return
         else:
