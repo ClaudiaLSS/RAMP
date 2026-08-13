@@ -222,8 +222,8 @@ The **"allowed values"** column provide information about the format one should 
      - 0
    * - window_j_end
      - minutes
-     - in [0,1440]
-     - End time of time-window j. Only necessary if num_windows is set to j or greater
+     - in [0,2879]
+     - End time of time-window j. Only necessary if num_windows is set to j or greater. A value greater than 1440 declares a window crossing midnight, see :ref:`windows_crossing_midnight`
      - integer
      - yes
      - 0
@@ -253,6 +253,40 @@ The parameters to describe a window of time should directly be
 provided as a numpy array ( for example
 ``window_j = np.array([window_j_start, window_j_end])``) (where j is an
 integer smaller or equal to the provided value of ``num_windows``).
+
+.. _windows_crossing_midnight:
+
+Windows crossing midnight
+-------------------------
+
+An appliance which is used continuously from the evening until the next
+morning must be described by a **single** window whose end time is
+greater than 1440. For example a light which is on from 20:00 until
+05:00 of the following day is declared as:
+
+.. code-block:: python
+
+   light.windows(window_1=[1200, 1740])   # 1740 = 1440 + 300
+
+Do **not** describe such a use as two windows (``[1200, 1440]`` and
+``[0, 300]``). Two windows are independent as far as the algorithm is
+concerned: their boundaries are randomised separately with
+``random_var_w``, and each of them receives its own switch-on events,
+whose duration is at most the remaining time until the end of the
+window. The appliance is therefore systematically switched off around
+midnight, even though it was meant to stay on all night.
+
+With a single window crossing midnight, the boundaries are randomised
+once, a switch-on event may span midnight, and the part of the event
+which lies past minute 1440 is added to the morning of the following
+day. The simulated horizon is treated as periodic, so the after-midnight
+part of the last day is added to the first day; this keeps the total
+energy of the simulation unchanged and leaves no discontinuity at either
+end of the horizon.
+
+Two restrictions apply: only the *end* of a window may cross midnight
+(a window may not start after minute 1440), and no window may be longer
+than one day.
 
 If no duty cycle parameter is provided to the ``add_appliance`` method
 of the user, then one can enable up to 3 different duty cycles by calling 
