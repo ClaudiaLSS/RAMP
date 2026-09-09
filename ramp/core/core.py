@@ -363,8 +363,10 @@ class UseCase:
         for user in self.users:
             tot_max_profile = tot_max_profile + user.maximum_profile
         # Find the peak window within the theoretical max profile
-        peak_window = np.squeeze(
-            np.argwhere(tot_max_profile == np.amax(tot_max_profile))
+        # atleast_1d keeps a peak window of a single minute as a 1 element array: squeeze
+        # would otherwise collapse it to a 0 dimensional array, which cannot be indexed
+        peak_window = np.atleast_1d(
+            np.squeeze(np.argwhere(tot_max_profile == np.amax(tot_max_profile)))
         )
         # Within the peak_window, randomly calculate the peak_time using a gaussian distribution
         peak_time = round(
@@ -1188,6 +1190,9 @@ class Appliance:
         self.random_var_2 = 0
         self.random_var_3 = 0
         self.daily_use = np.zeros(1440)
+        # mask of the windows of use, assigned by the windows method. Kept separate from
+        # daily_use, which holds the realised load of the day currently being simulated
+        self.windows_mask = np.zeros(1440)
         self.free_spots = None
 
         # attributes used for specific fixed and random cycles
@@ -1429,6 +1434,10 @@ class Appliance:
         self.daily_use[self.window_3[0] : (self.window_3[1])] = np.full(
             np.diff(self.window_3), 0.001
         )  # same as above for window3
+        # keep an immutable copy of that mask: daily_use is overwritten with the realised
+        # load of the day being simulated on every call to generate_load_profile, whereas
+        # maximum_profile needs the windows of use, which do not change during a simulation
+        self.windows_mask = self.daily_use.copy()
 
         self.random_var_1 = int(
             random_var_w * np.diff(self.window_1)[0]
@@ -1594,8 +1603,16 @@ class Appliance:
         np.array
             It assumes the appliance is always switched-on with maximum power and
             numerosity during all of its potential windows of use
+
+        Notes
+        -----
+        This is derived from ``windows_mask`` and not from ``daily_use``. The two are
+        identical until the first day is simulated, after which ``daily_use`` holds the
+        realised load of the last simulated day. Reading it here would make the
+        "theoretical maximum" depend on the simulation state, and would scale an already
+        power-weighted profile by the power a second time.
         """
-        return self.daily_use * np.mean(self.power) * self.number
+        return self.windows_mask * np.mean(self.power) * self.number
 
     def specific_cycle(self, cycle_num, **kwargs):
         """assigining specific duty cycle for the appliance (maximum of three cycles can be assigned)
